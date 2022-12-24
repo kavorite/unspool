@@ -73,6 +73,10 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
 			batch.Put(key, val)
+			idx := bytes.NewBuffer(make([]byte, 0, 3+binary.Size(msg.Timestamp)))
+			idx.WriteString("ts/")
+			binary.Write(idx, binary.BigEndian, msg.Timestamp)
+			batch.Put(idx.Bytes(), key)
 			if err != nil {
 				return
 			}
