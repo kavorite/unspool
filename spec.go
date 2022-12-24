@@ -1,16 +1,10 @@
 package main
 
 import (
+	"strings"
 	"time"
+	"unicode"
 )
-
-type Short uint16
-
-type Integer uint32
-
-type Long int64
-
-type Timestamp Long
 
 func (ns Timestamp) Time() time.Time {
 	return time.Unix(0, (int64)(ns))
@@ -29,7 +23,19 @@ type TransportHeader struct {
 	Timestamp
 }
 
-type Symbol [8]uint8
+type Short uint16
+
+type Integer uint32
+
+type Long int64
+
+type Timestamp Long
+
+type Symbol [8]byte
+
+func (s Symbol) ToString() string {
+	return strings.TrimRightFunc(string(s[:]), unicode.IsSpace)
+}
 
 type Typecode uint8
 
