@@ -2,23 +2,21 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/schollz/progressbar/v3"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 func fck(err error) {
@@ -27,26 +25,21 @@ func fck(err error) {
 	}
 }
 
-func entKey(msg Message) []byte {
-	sym := []byte(strings.TrimRightFunc(string(msg.Symbol[:]), unicode.IsSpace))
-	buf := bytes.NewBuffer(make([]uint8, 0, len(sym)+9))
-	buf.WriteByte(byte(msg.Typecode))
-	buf.WriteByte('/')
-	buf.Write(sym)
-	buf.WriteByte('/')
-	binary.Write(buf, binary.BigEndian, msg.Timestamp)
-	return buf.Bytes()
+type Record struct {
+	Message
+	Payload []byte
 }
 
 var pfxLength = binary.Size(Message{})
 
-func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records []Record, err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
 	if err != nil {
 		return
 	}
+	records = make([]Record, 0, header.MessageCount)
 	for i := 0; i < int(header.MessageCount); i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -68,11 +61,16 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			if err != nil {
 				return
 			}
-			cursor.Seek(-int64(pfxLength), io.SeekCurrent)
-			key := entKey(msg)
+			_, err = cursor.Seek(-int64(pfxLength), io.SeekCurrent)
+			if err != nil {
+				return
+			}
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
-			batch.Put(key, val)
+			if err != nil {
+				return
+			}
+			records = append(records, Record{Message: msg, Payload: val})
 			if err != nil {
 				return
 			}
@@ -82,8 +80,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 }
 
 func main() {
-	dbName := ""
-	allow := ""
+	var dbName, allow string
 	flag.StringVar(&dbName, "db", "", "path to destination LevelDB")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.Parse()
@@ -91,18 +88,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, &opt.Options{
-		WriteBuffer: 64 << 20,
-		// BlockSize:   128 << 20,
-		// BlockCacheCapacity: 512 << 20,
-		// DisableBlockCache: true,
-	})
-	// db, err := leveldb.OpenFile(dbName, nil)
+	db, err := sql.Open("sqlite3", dbName)
 	fck(err)
 	defer db.Close()
+
+	for _, cmd := range []string{
+		`CREATE TABLE IF NOT EXISTS messages (
+			message_id INTEGER PRIMARY KEY,
+			type TINYINT NOT NULL,
+			flags TINYINT NOT NULL,
+			timestamp INTEGER NOT NULL,
+			symbol TEXT NOT NULL,
+			payload BLOB NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS type_index ON messages (type)`,
+		`CREATE INDEX IF NOT EXISTS symbol_index ON messages (symbol)`,
+		`CREATE INDEX IF NOT EXISTS timestamp_index ON messages (timestamp)`,
+	} {
+		_, err = db.Exec(cmd)
+		fck(err)
+	}
 	wg := sync.WaitGroup{}
+	lck := sync.Mutex{}
 	defer wg.Wait()
-	batches := make(chan *leveldb.Batch, 128)
 	payloads := make(chan []byte)
 	defer close(payloads)
 	msgTypes := map[byte]struct{}{}
@@ -112,31 +120,42 @@ func main() {
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
 		go func() {
+			batchSize := 1024
 			defer wg.Done()
-			batch := &leveldb.Batch{}
-			clear := func(batch *leveldb.Batch) {
-				batches <- batch
+			fck(err)
+			batch := make([]Record, 0, batchSize)
+			flush := func(batch []Record) {
+				lck.Lock()
+				defer lck.Unlock()
+				txn, err := db.Begin()
+				fck(err)
+				stmt, err := txn.Prepare(
+					`INSERT INTO messages
+						(type, flags, timestamp, symbol, payload)
+					VALUES (?, ?, ?, ?, ?)`,
+				)
+				fck(err)
+				for _, record := range batch {
+					_, err = stmt.Exec(record.Typecode, record.Flags, record.Timestamp, record.Symbol.ToString(), record.Payload)
+					fck(err)
+				}
+				txn.Commit()
 			}
-			defer clear(batch)
+			defer flush(batch)
 			for payload := range payloads {
-				err := processPayload(batch, msgTypes, payload)
+				chunk, err := processPayload(msgTypes, payload)
+				batch = append(batch, chunk...)
 				if err != io.EOF {
 					fck(err)
 				}
-				if batch.Len() >= 1<<16 {
-					clear(batch)
-					batch = &leveldb.Batch{}
+				if len(batch) >= 1024 {
+					flush(batch)
+					batch = make([]Record, 0, batchSize)
+					fck(err)
 				}
 			}
 		}()
 	}
-
-	go func() {
-		for batch := range batches {
-			err := db.Write(batch, &opt.WriteOptions{NoWriteMerge: true})
-			fck(err)
-		}
-	}()
 
 	paths := flag.Args()
 	for _, path := range paths {
