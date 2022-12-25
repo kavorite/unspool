@@ -9,14 +9,14 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
+	"github.com/nakabonne/tstorage"
 
 	"github.com/schollz/progressbar/v3"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 func fck(err error) {
@@ -25,7 +25,7 @@ func fck(err error) {
 	}
 }
 
-func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (batch []tstorage.Row, err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
@@ -47,27 +47,54 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 		if err != nil {
 			return
 		}
-		if _, allow := allowTypeCodes[typecode]; allow {
-			msg := Message{}
-			err = binary.Read(cursor, binary.LittleEndian, &msg)
-			if err != nil {
-				return
+
+		record := func(msg Message, price float64, side string) tstorage.Row {
+			return tstorage.Row{
+				Metric: "price",
+				Labels: []tstorage.Label{
+					{Name: "symbol", Value: msg.Symbol.ToString()},
+					{Name: "side", Value: side},
+					{Name: "type", Value: string([]byte{byte(msg.Typecode)})},
+				},
+				DataPoint: tstorage.DataPoint{
+					Value:     price,
+					Timestamp: int64(msg.Timestamp),
+				},
 			}
-			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
-			val := make([]byte, 0, mLength)
-			_, err = cursor.Read(val)
-			pfx := "t/"
-			buf := bytes.NewBuffer(make([]byte, 0, len(pfx)+binary.Size(msg.Timestamp)))
-			buf.WriteString(pfx)
-			binary.Write(buf, binary.BigEndian, msg.Timestamp)
-			key := buf.Bytes()
-			batch.Put(key, val)
-			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.ToString())), key...)
-			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
-			batch.Put(sym, []byte{})
-			batch.Put(typ, []byte{})
-			if err != nil {
-				return
+		}
+
+		if _, allow := allowTypeCodes[typecode]; allow {
+			switch typecode {
+			case 'T':
+				trade := TradeReport{}
+				err = binary.Read(cursor, binary.LittleEndian, &trade)
+				if err != nil {
+					return
+				}
+				batch = append(batch, record(trade.Message, trade.Price.Value(), "trade"))
+			case 'Q':
+				quote := QuoteUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &quote)
+				if err != nil {
+					return
+				}
+				batch = append(batch, record(quote.Message, quote.AskPrice.Value(), "ask"))
+				batch = append(batch, record(quote.Message, quote.BidPrice.Value(), "bid"))
+			case '8', '5':
+				level := PriceLevelUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &level)
+				var side string
+				if typecode == '8' {
+					side = "bid"
+				} else {
+					side = "ask"
+				}
+				batch = append(batch, record(level.Message, level.Price.Value(), side))
+				if err != nil {
+					return
+				}
+			default:
+				continue
 			}
 		}
 	}
@@ -77,23 +104,21 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 func main() {
 	dbName := ""
 	allow := ""
-	flag.StringVar(&dbName, "db", "", "path to destination LevelDB")
+	flag.StringVar(&dbName, "db", "", "path to destination tstorage")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.Parse()
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, &opt.Options{
-		WriteBuffer: 64 << 20,
-		// BlockSize:   128 << 20,
-		// BlockCacheCapacity: 128 << 20,
-		// DisableBlockCache: true,
-	})
-	// db, err := leveldb.OpenFile(dbName, nil)
+	db, err := tstorage.NewStorage(
+		tstorage.WithDataPath(dbName),
+		tstorage.WithPartitionDuration(30*time.Minute),
+		tstorage.WithTimestampPrecision(tstorage.Nanoseconds),
+	)
 	fck(err)
 	defer db.Close()
-	batches := make(chan *leveldb.Batch, 128)
+	batches := make(chan []tstorage.Row, 128)
 	defer close(batches)
 	payloads := make(chan []byte)
 	defer close(payloads)
@@ -107,21 +132,23 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			batch := &leveldb.Batch{}
-			flush := func(batch *leveldb.Batch) {
+			batch := make([]tstorage.Row, 0, 1<<16)
+			flush := func(batch []tstorage.Row) {
 				batches <- batch
 			}
 			defer flush(batch)
 			for payload := range payloads {
-				err := processPayload(batch, msgTypes, payload)
+				chunk, err := processPayload(msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
-				if batch.Len() >= 1<<16 {
-					flush(batch)
-					batch = &leveldb.Batch{}
+				if len(batch)+len(chunk) >= 1<<16 {
+					batches <- batch
+					batch = make([]tstorage.Row, 0, 1<<16)
 				}
+				batch = append(batch, chunk...)
 			}
+			batches <- batch
 		}()
 	}
 
@@ -129,7 +156,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for batch := range batches {
-			err := db.Write(batch, &opt.WriteOptions{NoWriteMerge: true})
+			err := db.InsertRows(batch)
 			fck(err)
 		}
 	}()

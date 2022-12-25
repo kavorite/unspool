@@ -29,6 +29,12 @@ type Integer uint32
 
 type Long int64
 
+type Price Long
+
+func (p Price) Value() float64 {
+	return (float64)(p) / 1e4
+}
+
 type Timestamp Long
 
 type Symbol [8]byte
@@ -44,4 +50,26 @@ type Message struct {
 	Flags uint8
 	Timestamp
 	Symbol
+}
+
+type Order struct {
+	Size Short
+	Price
+}
+type TradeReport struct {
+	Message
+	Order
+}
+
+type QuoteUpdate struct {
+	Message
+	BidSize  Short
+	BidPrice Price
+	AskPrice Price
+	AskSize  Short
+}
+
+type PriceLevelUpdate struct {
+	Message
+	Order
 }
