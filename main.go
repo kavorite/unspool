@@ -8,9 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
@@ -26,19 +24,6 @@ func fck(err error) {
 		panic(err)
 	}
 }
-
-func entKey(msg Message) []byte {
-	sym := []byte(strings.TrimRightFunc(string(msg.Symbol[:]), unicode.IsSpace))
-	buf := bytes.NewBuffer(make([]uint8, 0, len(sym)+9))
-	buf.WriteByte(byte(msg.Typecode))
-	buf.WriteByte('/')
-	buf.Write(sym)
-	buf.WriteByte('/')
-	binary.Write(buf, binary.BigEndian, msg.Timestamp)
-	return buf.Bytes()
-}
-
-var pfxLength = binary.Size(Message{})
 
 func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
 	cursor := bytes.NewReader(payload)
@@ -68,15 +53,19 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			if err != nil {
 				return
 			}
-			cursor.Seek(-int64(pfxLength), io.SeekCurrent)
-			key := entKey(msg)
+			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
+			pfx := "t/"
+			buf := bytes.NewBuffer(make([]byte, 0, len(pfx)+binary.Size(msg.Timestamp)))
+			buf.WriteString(pfx)
+			binary.Write(buf, binary.BigEndian, msg.Timestamp)
+			key := buf.Bytes()
 			batch.Put(key, val)
-			idx := bytes.NewBuffer(make([]byte, 0, 3+binary.Size(msg.Timestamp)))
-			idx.WriteString("ts/")
-			binary.Write(idx, binary.BigEndian, msg.Timestamp)
-			batch.Put(idx.Bytes(), key)
+			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.ToString())), key...)
+			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
+			batch.Put(sym, []byte{})
+			batch.Put(typ, []byte{})
 			if err != nil {
 				return
 			}
@@ -98,44 +87,47 @@ func main() {
 	db, err := leveldb.OpenFile(dbName, &opt.Options{
 		WriteBuffer: 64 << 20,
 		// BlockSize:   128 << 20,
-		// BlockCacheCapacity: 512 << 20,
+		// BlockCacheCapacity: 128 << 20,
 		// DisableBlockCache: true,
 	})
 	// db, err := leveldb.OpenFile(dbName, nil)
 	fck(err)
 	defer db.Close()
-	wg := sync.WaitGroup{}
-	defer wg.Wait()
 	batches := make(chan *leveldb.Batch, 128)
+	defer close(batches)
 	payloads := make(chan []byte)
 	defer close(payloads)
 	msgTypes := map[byte]struct{}{}
 	for _, t := range []byte(allow) {
 		msgTypes[t] = struct{}{}
 	}
+	wg := sync.WaitGroup{}
+	defer wg.Wait()
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			batch := &leveldb.Batch{}
-			clear := func(batch *leveldb.Batch) {
+			flush := func(batch *leveldb.Batch) {
 				batches <- batch
 			}
-			defer clear(batch)
+			defer flush(batch)
 			for payload := range payloads {
 				err := processPayload(batch, msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
 				if batch.Len() >= 1<<16 {
-					clear(batch)
+					flush(batch)
 					batch = &leveldb.Batch{}
 				}
 			}
 		}()
 	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for batch := range batches {
 			err := db.Write(batch, &opt.WriteOptions{NoWriteMerge: true})
 			fck(err)
