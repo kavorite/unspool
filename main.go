@@ -13,10 +13,9 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
+	"github.com/tecbot/gorocksdb"
 
 	"github.com/schollz/progressbar/v3"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 func fck(err error) {
@@ -25,7 +24,7 @@ func fck(err error) {
 	}
 }
 
-func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func processPayload(batch *gorocksdb.WriteBatch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
@@ -56,15 +55,18 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
-			pfx := "t/"
-			buf := bytes.NewBuffer(make([]byte, 0, len(pfx)+binary.Size(msg.Timestamp)))
-			buf.WriteString(pfx)
+			if err != nil {
+				return
+			}
+			buf := bytes.NewBuffer(make([]byte, 0, binary.Size(msg.Timestamp)))
 			binary.Write(buf, binary.BigEndian, msg.Timestamp)
 			key := buf.Bytes()
-			batch.Put(key, val)
-			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.ToString())), key...)
-			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
+			batch.Put(append([]byte("chron/"), key...), val)
+			sym := []byte(fmt.Sprintf("asset/%s/", msg.Symbol.ToString()))
+			sym = append(sym, key...)
 			batch.Put(sym, []byte{})
+			typ := []byte(fmt.Sprintf("event/%c/", byte(msg.Typecode)))
+			typ = append(typ, key...)
 			batch.Put(typ, []byte{})
 			if err != nil {
 				return
@@ -84,16 +86,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, &opt.Options{
-		WriteBuffer: 64 << 20,
-		// BlockSize:   128 << 20,
-		// BlockCacheCapacity: 128 << 20,
-		// DisableBlockCache: true,
-	})
-	// db, err := leveldb.OpenFile(dbName, nil)
+	bbto := gorocksdb.NewDefaultBlockBasedTableOptions()
+	bbto.SetNoBlockCache(true)
+	opts := gorocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(true)
+	opts.SetBlockBasedTableFactory(bbto)
+	db, err := gorocksdb.OpenDb(opts, dbName)
 	fck(err)
 	defer db.Close()
-	batches := make(chan *leveldb.Batch, 128)
+	batches := make(chan *gorocksdb.WriteBatch, 128)
 	defer close(batches)
 	payloads := make(chan []byte)
 	defer close(payloads)
@@ -107,19 +108,18 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			batch := &leveldb.Batch{}
-			flush := func(batch *leveldb.Batch) {
+			batch := gorocksdb.NewWriteBatch()
+			defer func() {
 				batches <- batch
-			}
-			defer flush(batch)
+			}()
 			for payload := range payloads {
 				err := processPayload(batch, msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
-				if batch.Len() >= 1<<16 {
-					flush(batch)
-					batch = &leveldb.Batch{}
+				if batch.Count() >= 1<<16 {
+					batches <- batch
+					batch = gorocksdb.NewWriteBatch()
 				}
 			}
 		}()
@@ -127,10 +127,14 @@ func main() {
 
 	wg.Add(1)
 	go func() {
+		opt := gorocksdb.NewDefaultWriteOptions()
+		opt.DisableWAL(true)
+		defer opt.Destroy()
 		defer wg.Done()
 		for batch := range batches {
-			err := db.Write(batch, &opt.WriteOptions{NoWriteMerge: true})
+			err := db.Write(opt, batch)
 			fck(err)
+			batch.Destroy()
 		}
 	}()
 
