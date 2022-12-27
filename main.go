@@ -56,6 +56,9 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
+			if err != nil {
+				return
+			}
 			pfx := "t/"
 			buf := bytes.NewBuffer(make([]byte, 0, len(pfx)+binary.Size(msg.Timestamp)))
 			buf.WriteString(pfx)
