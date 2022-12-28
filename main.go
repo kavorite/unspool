@@ -65,7 +65,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			binary.Write(buf, binary.BigEndian, msg.Timestamp)
 			key := buf.Bytes()
 			batch.Put(key, val)
-			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.ToString())), key...)
+			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.String())), key...)
 			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
 			batch.Put(sym, []byte{})
 			batch.Put(typ, []byte{})
