@@ -42,7 +42,7 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 	}
 	head := payload[offset:]
 	length := int64(header.PayloadLength)
-	head, tail := head[:length], head[length+1:]
+	head, tail := head[:length], head[length:]
 	cursor = bytes.NewReader(head)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
