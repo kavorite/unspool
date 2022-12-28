@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
@@ -62,9 +61,8 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 
 		if _, allow := allowTypeCodes[typecode]; allow {
 			var (
-				tags      map[string]string
-				fields    map[string]interface{}
-				timestamp time.Time
+				tags   map[string]string
+				fields map[string]interface{}
 			)
 			switch typecode {
 			case 'T':
@@ -80,7 +78,7 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 				fields = map[string]interface{}{
 					"price": trade.Price.Float64(),
 				}
-				timestamp = trade.Time()
+				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, trade.Time()))
 			case 'Q':
 				quote := QuoteUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &quote)
@@ -90,27 +88,45 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 				tags = map[string]string{
 					"asset": quote.Symbol.String(),
 					"event": quote.Typecode.String(),
+					"side":  "ask",
 				}
 				fields = map[string]interface{}{
-					"ask_price": quote.AskPrice.Float64(),
-					"bid_price": quote.BidPrice.Float64(),
+					"price": quote.AskPrice.Float64(),
+					"size":  quote.AskSize,
 				}
-				timestamp = quote.Time()
+				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, quote.Time()))
+				tags = map[string]string{
+					"asset": quote.Symbol.String(),
+					"event": quote.Typecode.String(),
+					"side":  "bid",
+				}
+				fields = map[string]interface{}{
+					"price": quote.BidPrice.Float64(),
+					"size":  quote.BidSize,
+				}
+				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, quote.Time()))
 			case '8', '5':
 				order := PriceLevelUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &order)
 				if err != nil {
 					return
 				}
+				var side string
+				if typecode == '8' {
+					side = "bid"
+				} else {
+					side = "ask"
+				}
 				tags = map[string]string{
 					"asset": order.Symbol.String(),
 					"event": order.Typecode.String(),
+					"side":  side,
 				}
 				fields = map[string]interface{}{
 					"price": order.Price.Float64(),
 					"size":  order.Size,
 				}
-				timestamp = order.Time()
+				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, order.Time()))
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -118,8 +134,6 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 				}
 				continue
 			}
-			point := influxdb2.NewPoint(measurement, tags, fields, timestamp)
-			steno.WritePoint(point)
 		}
 	}
 	if len(tail) > 0 {
