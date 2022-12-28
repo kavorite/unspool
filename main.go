@@ -78,7 +78,7 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 					"event": trade.Typecode.String(),
 				}
 				fields = map[string]interface{}{
-					"price": trade.Price.Value(),
+					"price": trade.Price.Float64(),
 				}
 				timestamp = trade.Time()
 			case 'Q':
@@ -92,8 +92,8 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 					"event": quote.Typecode.String(),
 				}
 				fields = map[string]interface{}{
-					"ask_price": quote.AskPrice.Value(),
-					"bid_price": quote.BidPrice.Value(),
+					"ask_price": quote.AskPrice.Float64(),
+					"bid_price": quote.BidPrice.Float64(),
 				}
 				timestamp = quote.Time()
 			case '8', '5':
@@ -107,7 +107,7 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 					"event": order.Typecode.String(),
 				}
 				fields = map[string]interface{}{
-					"price": order.Price.Value(),
+					"price": order.Price.Float64(),
 					"size":  order.Size,
 				}
 				timestamp = order.Time()

@@ -31,7 +31,7 @@ type Long int64
 
 type Price Long
 
-func (p Price) Value() float64 {
+func (p Price) Float64() float64 {
 	return (float64)(p) / 1e4
 }
 
