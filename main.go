@@ -59,12 +59,10 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			if err != nil {
 				return
 			}
-			pfx := "t/"
-			buf := bytes.NewBuffer(make([]byte, 0, len(pfx)+binary.Size(msg.Timestamp)))
-			buf.WriteString(pfx)
+			buf := bytes.NewBuffer(make([]byte, 0, binary.Size(msg.Timestamp)))
 			binary.Write(buf, binary.BigEndian, msg.Timestamp)
 			key := buf.Bytes()
-			batch.Put(key, val)
+			batch.Put(append([]byte("chron/"), key...), val)
 			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.String())), key...)
 			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
 			batch.Put(sym, []byte{})
