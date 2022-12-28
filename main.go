@@ -40,13 +40,10 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 	if err != nil {
 		return
 	}
-	if int64(len(payload))-int64(offset) > int64(header.PayloadLength) {
-		err = processPayload(steno, measurement, allowTypeCodes, payload[offset+int64(header.PayloadLength):])
-		if err != nil {
-			return
-		}
-	}
-	cursor = bytes.NewReader(payload[offset : offset+int64(header.PayloadLength)])
+	head := payload[offset:]
+	length := int64(header.PayloadLength)
+	head, tail := head[:length], head[length+1:]
+	cursor = bytes.NewReader(head)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -124,6 +121,9 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 			point := influxdb2.NewPoint(measurement, tags, fields, timestamp)
 			steno.WritePoint(point)
 		}
+	}
+	if len(tail) > 0 {
+		err = processPayload(steno, measurement, allowTypeCodes, tail)
 	}
 	return
 }
