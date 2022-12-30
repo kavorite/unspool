@@ -2,14 +2,12 @@ package main
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 
 	"github.com/google/gopacket"
@@ -28,7 +26,7 @@ func fck(err error) {
 	}
 }
 
-func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func processPayload(steno api.WriteAPI, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
@@ -77,8 +75,9 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 				}
 				fields = map[string]interface{}{
 					"price": trade.Price.Float64(),
+					"size":  trade.Size,
 				}
-				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, trade.Time()))
+				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, trade.Time()))
 			case 'Q':
 				quote := QuoteUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &quote)
@@ -88,45 +87,42 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 				tags = map[string]string{
 					"asset": quote.Symbol.String(),
 					"event": quote.Typecode.String(),
-					"side":  "ask",
 				}
 				fields = map[string]interface{}{
-					"price": quote.AskPrice.Float64(),
-					"size":  quote.AskSize,
+					"ask_price": quote.AskPrice.Float64(),
+					"ask_size":  quote.AskSize,
 				}
-				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, quote.Time()))
+				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, quote.Time()))
 				tags = map[string]string{
 					"asset": quote.Symbol.String(),
 					"event": quote.Typecode.String(),
-					"side":  "bid",
 				}
 				fields = map[string]interface{}{
-					"price": quote.BidPrice.Float64(),
-					"size":  quote.BidSize,
+					"bid_price": quote.BidPrice.Float64(),
+					"size":      quote.BidSize,
 				}
-				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, quote.Time()))
+				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, quote.Time()))
 			case '8', '5':
 				order := PriceLevelUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &order)
 				if err != nil {
 					return
 				}
-				var side string
-				if typecode == '8' {
-					side = "bid"
-				} else {
-					side = "ask"
-				}
 				tags = map[string]string{
 					"asset": order.Symbol.String(),
 					"event": order.Typecode.String(),
-					"side":  side,
+				}
+				var priceKey string
+				if typecode == '8' {
+					priceKey = "bid_price"
+				} else {
+					priceKey = "ask_price"
 				}
 				fields = map[string]interface{}{
-					"price": order.Price.Float64(),
-					"size":  order.Size,
+					priceKey: order.Price.Float64(),
+					"size":   order.Size,
 				}
-				steno.WritePoint(influxdb2.NewPoint(measurement, tags, fields, order.Time()))
+				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, order.Time()))
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -137,7 +133,7 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 		}
 	}
 	if len(tail) > 0 {
-		err = processPayload(steno, measurement, allowTypeCodes, tail)
+		err = processPayload(steno, allowTypeCodes, tail)
 	}
 	return
 }
@@ -145,14 +141,15 @@ func processPayload(steno api.WriteAPI, measurement string, allowTypeCodes map[b
 func main() {
 	godotenv.Load()
 	var (
-		dbName, allow, org, bucket, token, measurement string
+		dbName, allow, org, bucket, token string
+		gzip                              bool
 	)
 	flag.StringVar(&org, "org", "", "organization name")
 	flag.StringVar(&dbName, "db", "http://localhost:8086", "url of destination influxdb")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.StringVar(&bucket, "bucket", "hist", "destination bucket")
 	flag.StringVar(&token, "token", "", "authentication token")
-	flag.StringVar(&measurement, "measurement", "hist", "destination measurement")
+	flag.BoolVar(&gzip, "gzip", false, "use gzip compression")
 	flag.Parse()
 	if token == "" {
 		token = os.Getenv("INFLUXDB_TOKEN")
@@ -161,7 +158,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	dbopt := influxdb2.DefaultOptions().SetUseGZip(false).SetTLSConfig(&tls.Config{InsecureSkipVerify: strings.Contains(dbName, "localhost")})
+	dbopt := influxdb2.DefaultOptions().SetUseGZip(gzip)
 	dbopt.SetBatchSize(1 << 16)
 	db := influxdb2.NewClientWithOptions(dbName, token, dbopt)
 	steno := db.WriteAPI(org, bucket)
@@ -172,14 +169,14 @@ func main() {
 	}
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
-	payloads := make(chan []byte)
+	payloads := make(chan []byte, 1024)
 	defer close(payloads)
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for payload := range payloads {
-				err := processPayload(steno, measurement, msgTypes, payload)
+				err := processPayload(steno, msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
@@ -188,18 +185,34 @@ func main() {
 	}
 	paths := flag.Args()
 	for _, path := range paths {
-		stat, err := os.Stat(path)
-		fck(err)
-		bar := progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
-		defer bar.Close()
-		f, err := os.Open(path)
-		fck(err)
+		var (
+			f   *os.File
+			bar *progressbar.ProgressBar
+			err error
+		)
+		stdin := path == "-"
+		if !stdin {
+			defer bar.Close()
+		}
+
+		if stdin {
+			bar = progressbar.DefaultBytes(-1, "ingest stdin...")
+			f = os.Stdin
+		} else {
+			stat, err := os.Stat(path)
+			fck(err)
+			bar = progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
+			f, err = os.Open(path)
+			fck(err)
+		}
 		t := io.TeeReader(f, bar)
 		g, err := pgzip.NewReader(t)
 		fck(err)
 		p, err := pcapgo.NewNgReader(g, pcapgo.DefaultNgReaderOptions)
 		fck(err)
-		defer g.Close()
+		if !stdin {
+			defer g.Close()
+		}
 		fck(err)
 		src := gopacket.NewPacketSource(p, p.LinkType())
 		src.DecodeOptions.Lazy = true
