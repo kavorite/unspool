@@ -11,11 +11,11 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -30,8 +30,6 @@ type Record struct {
 	Payload []byte
 }
 
-var pfxLength = binary.Size(Message{})
-
 func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records []Record, err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
@@ -40,7 +38,7 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 		return
 	}
 	records = make([]Record, 0, header.MessageCount)
-	for i := 0; i < int(header.MessageCount); i++ {
+	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
 		if err != nil {
@@ -61,16 +59,15 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 			if err != nil {
 				return
 			}
-			_, err = cursor.Seek(-int64(pfxLength), io.SeekCurrent)
-			if err != nil {
-				return
-			}
+			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
 			val := make([]byte, 0, mLength)
 			_, err = cursor.Read(val)
 			if err != nil {
 				return
 			}
 			records = append(records, Record{Message: msg, Payload: val})
+		} else {
+			_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 			if err != nil {
 				return
 			}
@@ -79,37 +76,45 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 	return
 }
 
+func createIndexIfNotExist(db *sql.DB, table, field, index string) (err error) {
+	_, err = db.Exec(fmt.Sprintf(`CREATE INDEX %s ON %s (%s)`, index, table, field))
+	if err != nil {
+		if merr, ok := err.(*mysql.MySQLError); ok {
+			if merr.Message == fmt.Sprintf("Duplicate key name '%s'", index) {
+				err = nil
+			}
+		}
+		return
+	}
+	return
+}
+
 func main() {
-	var dbName, allow string
-	flag.StringVar(&dbName, "db", "", "path to destination LevelDB")
+	var dsn, allow string
+	flag.StringVar(&dsn, "db", "", "MySQL DSN")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.Parse()
-	if dbName == "" {
+	if dsn == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := sql.Open("sqlite3", dbName)
+	db, err := sql.Open("mysql", dsn)
 	fck(err)
 	defer db.Close()
 
-	for _, cmd := range []string{
-		`CREATE TABLE IF NOT EXISTS messages (
-			message_id INTEGER PRIMARY KEY,
-			type TINYINT NOT NULL,
-			flags TINYINT NOT NULL,
-			timestamp INTEGER NOT NULL,
-			symbol TEXT NOT NULL,
-			payload BLOB NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS type_index ON messages (type)`,
-		`CREATE INDEX IF NOT EXISTS symbol_index ON messages (symbol)`,
-		`CREATE INDEX IF NOT EXISTS timestamp_index ON messages (timestamp)`,
-	} {
-		_, err = db.Exec(cmd)
-		fck(err)
-	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
+		id SERIAL PRIMARY KEY,
+		event CHAR(1) NOT NULL,
+		flags BIT(8) NOT NULL,
+		time TIMESTAMP NOT NULL,
+		symbol VARCHAR(8) NOT NULL,
+		payload TINYBLOB NOT NULL
+	)`)
+	fck(err)
+	fck(createIndexIfNotExist(db, "messages", "event", "event_index"))
+	fck(createIndexIfNotExist(db, "messages", "symbol", "symbol_index"))
+	fck(createIndexIfNotExist(db, "messages", "time", "time_index"))
 	wg := sync.WaitGroup{}
-	lck := sync.Mutex{}
 	defer wg.Wait()
 	payloads := make(chan []byte)
 	defer close(payloads)
@@ -125,21 +130,19 @@ func main() {
 			fck(err)
 			batch := make([]Record, 0, batchSize)
 			flush := func(batch []Record) {
-				lck.Lock()
-				defer lck.Unlock()
 				txn, err := db.Begin()
 				fck(err)
+
 				stmt, err := txn.Prepare(
-					`INSERT INTO messages
-						(type, flags, timestamp, symbol, payload)
-					VALUES (?, ?, ?, ?, ?)`,
+					"INSERT INTO messages (event, flags, time, symbol, payload) VALUES (?, ?, ?, ?, ?)",
 				)
 				fck(err)
 				for _, record := range batch {
-					_, err = stmt.Exec(record.Typecode, record.Flags, record.Timestamp, record.Symbol.ToString(), record.Payload)
+					_, err = stmt.Exec(record.Typecode.String(), record.Flags, record.Timestamp.Time(), record.Symbol.String(), record.Payload)
 					fck(err)
 				}
-				txn.Commit()
+				err = txn.Commit()
+				fck(err)
 			}
 			defer flush(batch)
 			for payload := range payloads {
@@ -148,7 +151,7 @@ func main() {
 				if err != io.EOF {
 					fck(err)
 				}
-				if len(batch) >= 1024 {
+				if len(batch) >= batchSize {
 					flush(batch)
 					batch = make([]Record, 0, batchSize)
 					fck(err)
