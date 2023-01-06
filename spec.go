@@ -1,14 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"time"
 	"unicode"
 )
-
-func (ns Timestamp) Time() time.Time {
-	return time.Unix(0, (int64)(ns))
-}
 
 type TransportHeader struct {
 	Version            uint8
@@ -31,17 +28,31 @@ type Long int64
 
 type Timestamp Long
 
+func (ns Timestamp) Time() time.Time {
+	return time.Unix(0, (int64)(ns))
+}
+
 type Symbol [8]byte
 
-func (s Symbol) ToString() string {
+func (s Symbol) String() string {
 	return strings.TrimRightFunc(string(s[:]), unicode.IsSpace)
 }
 
-type Typecode uint8
+type Typecode byte
+
+func (t Typecode) String() string {
+	return string(t)
+}
+
+type Flags uint8
+
+func (f Flags) String() string {
+	return fmt.Sprintf("%08b", f)
+}
 
 type Message struct {
 	Typecode
-	Flags uint8
+	Flags
 	Timestamp
 	Symbol
 }

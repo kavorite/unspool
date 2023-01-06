@@ -11,9 +11,9 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/klauspost/pgzip"
 
 	"github.com/schollz/progressbar/v3"
@@ -53,17 +53,14 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 		if err != nil {
 			return
 		}
-		if _, allow := allowTypeCodes[typecode]; allow {
-			msg := Message{}
-			err = binary.Read(cursor, binary.LittleEndian, &msg)
-			if err != nil {
-				return
-			}
-			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
-			val := make([]byte, 0, mLength)
+		if _, allow := allowTypeCodes[typecode]; mLength > 0 && allow {
+			val := make([]byte, mLength)
 			_, err = cursor.Read(val)
+			fck(err)
+			msg := Message{}
+			err = binary.Read(bytes.NewBuffer(val[:binary.Size(msg)]), binary.LittleEndian, &msg)
 			if err != nil {
-				return
+				continue
 			}
 			records = append(records, Record{Message: msg, Payload: val})
 		} else {
@@ -76,44 +73,28 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 	return
 }
 
-func createIndexIfNotExist(db *sql.DB, table, field, index string) (err error) {
-	_, err = db.Exec(fmt.Sprintf(`CREATE INDEX %s ON %s (%s)`, index, table, field))
-	if err != nil {
-		if merr, ok := err.(*mysql.MySQLError); ok {
-			if merr.Message == fmt.Sprintf("Duplicate key name '%s'", index) {
-				err = nil
-			}
-		}
-		return
-	}
-	return
-}
-
 func main() {
 	var dsn, allow string
-	flag.StringVar(&dsn, "db", "", "MySQL DSN")
+	flag.StringVar(&dsn, "db", "", "PostgreSQL DSN")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.Parse()
 	if dsn == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("pgx", dsn)
 	fck(err)
 	defer db.Close()
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
-		id SERIAL PRIMARY KEY,
-		event CHAR(1) NOT NULL,
+		ts BIGINT NOT NULL,
+		tcode CHAR(1) NOT NULL,
 		flags BIT(8) NOT NULL,
-		time TIMESTAMP NOT NULL,
 		symbol VARCHAR(8) NOT NULL,
-		payload TINYBLOB NOT NULL
+		payload BYTEA NOT NULL,
+		CONSTRAINT messages_pkey PRIMARY KEY (ts, tcode, symbol)
 	)`)
 	fck(err)
-	fck(createIndexIfNotExist(db, "messages", "event", "event_index"))
-	fck(createIndexIfNotExist(db, "messages", "symbol", "symbol_index"))
-	fck(createIndexIfNotExist(db, "messages", "time", "time_index"))
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
 	payloads := make(chan []byte)
@@ -125,21 +106,24 @@ func main() {
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
 		go func() {
-			batchSize := 1024
+			batchSize := 1 << 16
 			defer wg.Done()
 			fck(err)
 			batch := make([]Record, 0, batchSize)
 			flush := func(batch []Record) {
 				txn, err := db.Begin()
 				fck(err)
-
 				stmt, err := txn.Prepare(
-					"INSERT INTO messages (event, flags, time, symbol, payload) VALUES (?, ?, ?, ?, ?)",
+					`INSERT INTO messages (ts, tcode, flags, symbol, payload)
+					VALUES ($1, $2, $3, $4, $5)
+					ON CONFLICT DO NOTHING`,
 				)
 				fck(err)
 				for _, record := range batch {
-					_, err = stmt.Exec(record.Typecode.String(), record.Flags, record.Timestamp.Time(), record.Symbol.String(), record.Payload)
-					fck(err)
+					_, err = stmt.Exec(record.Timestamp, record.Typecode, record.Flags, record.Symbol.String(), record.Payload)
+					if err != io.EOF {
+						fck(err)
+					}
 				}
 				err = txn.Commit()
 				fck(err)
