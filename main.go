@@ -12,11 +12,9 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
-	"github.com/joho/godotenv"
 	"github.com/klauspost/pgzip"
+	"github.com/syndtr/goleveldb/leveldb"
 
-	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
-	"github.com/influxdata/influxdb-client-go/v2/api"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -26,21 +24,43 @@ func fck(err error) {
 	}
 }
 
-func processPayload(steno api.WriteAPI, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+const keySep = "::"
+
+func writePoint(batch *leveldb.Batch, msg Message, field string, value interface{}) {
+	ksz := 0
+	grp := []interface{}{field, msg.Typecode, msg.Symbol.String(), msg.Timestamp}
+	for i, v := range grp {
+		ksz += binary.Size(v)
+		if i != len(grp)-1 {
+			ksz += len(keySep)
+		}
+	}
+	key := bytes.NewBuffer(make([]byte, 0, ksz))
+	for i, v := range grp {
+		switch s := v.(type) {
+		case string:
+			key.WriteString(s)
+		default:
+			binary.Write(key, binary.BigEndian, v)
+		}
+		if i != len(grp)-1 {
+			key.WriteString(keySep)
+		}
+	}
+	val := bytes.NewBuffer(make([]byte, 0, binary.Size(value)))
+	binary.Write(val, binary.LittleEndian, value)
+	k := key.Bytes()
+	v := val.Bytes()
+	batch.Put(k, v)
+}
+
+func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
 	if err != nil {
 		return
 	}
-	offset, err := cursor.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return
-	}
-	head := payload[offset:]
-	length := int64(header.PayloadLength)
-	head, tail := head[:length], head[length:]
-	cursor = bytes.NewReader(head)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -56,12 +76,7 @@ func processPayload(steno api.WriteAPI, allowTypeCodes map[byte]struct{}, payloa
 		if err != nil {
 			return
 		}
-
 		if _, allow := allowTypeCodes[typecode]; allow {
-			var (
-				tags   map[string]string
-				fields map[string]interface{}
-			)
 			switch typecode {
 			case 'T':
 				trade := TradeReport{}
@@ -69,99 +84,57 @@ func processPayload(steno api.WriteAPI, allowTypeCodes map[byte]struct{}, payloa
 				if err != nil {
 					return
 				}
-				tags = map[string]string{
-					"asset": trade.Symbol.String(),
-					"event": trade.Typecode.String(),
-				}
-				fields = map[string]interface{}{
-					"price": trade.Price.Float64(),
-					"size":  trade.Size,
-				}
-				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, trade.Time()))
+				writePoint(batch, trade.Message, "price", trade.Price.Float())
 			case 'Q':
 				quote := QuoteUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &quote)
 				if err != nil {
 					return
 				}
-				tags = map[string]string{
-					"asset": quote.Symbol.String(),
-					"event": quote.Typecode.String(),
-				}
-				fields = map[string]interface{}{
-					"ask_price": quote.AskPrice.Float64(),
-					"ask_size":  quote.AskSize,
-				}
-				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, quote.Time()))
-				tags = map[string]string{
-					"asset": quote.Symbol.String(),
-					"event": quote.Typecode.String(),
-				}
-				fields = map[string]interface{}{
-					"bid_price": quote.BidPrice.Float64(),
-					"size":      quote.BidSize,
-				}
-				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, quote.Time()))
+				writePoint(batch, quote.Message, "ask_price", quote.BidPrice.Float())
+				writePoint(batch, quote.Message, "bid_price", quote.BidPrice.Float())
 			case '8', '5':
 				order := PriceLevelUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &order)
 				if err != nil {
 					return
 				}
-				tags = map[string]string{
-					"asset": order.Symbol.String(),
-					"event": order.Typecode.String(),
-				}
-				var priceKey string
+				var field string
 				if typecode == '8' {
-					priceKey = "bid_price"
+					field = "bid_price"
 				} else {
-					priceKey = "ask_price"
+					field = "ask_price"
 				}
-				fields = map[string]interface{}{
-					priceKey: order.Price.Float64(),
-					"size":   order.Size,
-				}
-				steno.WritePoint(influxdb2.NewPoint("hist", tags, fields, order.Time()))
+				writePoint(batch, order.Message, field, order.Price.Float())
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
 					return
 				}
-				continue
+			}
+		} else {
+			_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
+			if err != nil {
+				return
 			}
 		}
-	}
-	if len(tail) > 0 {
-		err = processPayload(steno, allowTypeCodes, tail)
 	}
 	return
 }
 
 func main() {
-	godotenv.Load()
 	var (
-		dbName, allow, org, bucket, token string
-		gzip                              bool
+		dbName, allow string
 	)
-	flag.StringVar(&org, "org", "", "organization name")
-	flag.StringVar(&dbName, "db", "http://localhost:8086", "url of destination influxdb")
+	flag.StringVar(&dbName, "db", "hist.db", "path to destination LevelDB")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
-	flag.StringVar(&bucket, "bucket", "hist", "destination bucket")
-	flag.StringVar(&token, "token", "", "authentication token")
-	flag.BoolVar(&gzip, "gzip", false, "use gzip compression")
 	flag.Parse()
-	if token == "" {
-		token = os.Getenv("INFLUXDB_TOKEN")
-	}
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	dbopt := influxdb2.DefaultOptions().SetUseGZip(gzip)
-	dbopt.SetBatchSize(1 << 16)
-	db := influxdb2.NewClientWithOptions(dbName, token, dbopt)
-	steno := db.WriteAPI(org, bucket)
+	db, err := leveldb.OpenFile(dbName, nil)
+	fck(err)
 	defer db.Close()
 	msgTypes := map[byte]struct{}{}
 	for _, t := range []byte(allow) {
@@ -175,10 +148,21 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			batch := leveldb.Batch{}
+			batchSize := 1 << 16
+			flush := func() {
+				err = db.Write(&batch, nil)
+				fck(err)
+				batch.Reset()
+			}
+			defer flush()
 			for payload := range payloads {
-				err := processPayload(steno, msgTypes, payload)
+				err := processPayload(&batch, msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
+				}
+				if batch.Len() >= batchSize {
+					flush()
 				}
 			}
 		}()
@@ -191,9 +175,6 @@ func main() {
 			err error
 		)
 		stdin := path == "-"
-		if !stdin {
-			defer bar.Close()
-		}
 
 		if stdin {
 			bar = progressbar.DefaultBytes(-1, "ingest stdin...")
