@@ -29,6 +29,16 @@ type Integer uint32
 
 type Long int64
 
+type Price Long
+
+func (p Price) Float64() float64 {
+	return (float64)(p) / 1e4
+}
+
+func (p Price) Float() float32 {
+	return (float32)(p) / 1e4
+}
+
 type Timestamp Long
 
 type Symbol [8]byte
@@ -50,17 +60,10 @@ type Message struct {
 	Symbol
 }
 
-type Price Long
-
-func (p Price) Float64() float64 {
-	return (float64)(p) / 1e4
-}
-
 type Order struct {
 	Size Integer
 	Price
 }
-
 type TradeReport struct {
 	Message
 	Order

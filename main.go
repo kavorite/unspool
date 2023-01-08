@@ -13,16 +13,45 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
+	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/schollz/progressbar/v3"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 func fck(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+const keySep = "::"
+
+func writePoint(batch *leveldb.Batch, msg Message, field string, value interface{}) {
+	ksz := 0
+	grp := []interface{}{field, msg.Typecode, msg.Symbol.String(), msg.Timestamp}
+	for i, v := range grp {
+		ksz += binary.Size(v)
+		if i != len(grp)-1 {
+			ksz += len(keySep)
+		}
+	}
+	key := bytes.NewBuffer(make([]byte, 0, ksz))
+	for i, v := range grp {
+		switch s := v.(type) {
+		case string:
+			key.WriteString(s)
+		default:
+			binary.Write(key, binary.BigEndian, v)
+		}
+		if i != len(grp)-1 {
+			key.WriteString(keySep)
+		}
+	}
+	val := bytes.NewBuffer(make([]byte, 0, binary.Size(value)))
+	binary.Write(val, binary.LittleEndian, value)
+	k := key.Bytes()
+	v := val.Bytes()
+	batch.Put(k, v)
 }
 
 func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
@@ -32,7 +61,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 	if err != nil {
 		return
 	}
-	for i := 0; i < int(header.MessageCount); i++ {
+	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
 		if err != nil {
@@ -48,25 +77,43 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			return
 		}
 		if _, allow := allowTypeCodes[typecode]; allow {
-			msg := Message{}
-			err = binary.Read(cursor, binary.LittleEndian, &msg)
-			if err != nil {
-				return
+			switch typecode {
+			case 'T':
+				trade := TradeReport{}
+				err = binary.Read(cursor, binary.LittleEndian, &trade)
+				if err != nil {
+					return
+				}
+				writePoint(batch, trade.Message, "price", trade.Price.Float())
+			case 'Q':
+				quote := QuoteUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &quote)
+				if err != nil {
+					return
+				}
+				writePoint(batch, quote.Message, "ask_price", quote.BidPrice.Float())
+				writePoint(batch, quote.Message, "bid_price", quote.BidPrice.Float())
+			case '8', '5':
+				order := PriceLevelUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &order)
+				if err != nil {
+					return
+				}
+				var field string
+				if typecode == '8' {
+					field = "bid_price"
+				} else {
+					field = "ask_price"
+				}
+				writePoint(batch, order.Message, field, order.Price.Float())
+			default:
+				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
+				if err != nil {
+					return
+				}
 			}
-			cursor.Seek(-int64(binary.Size(msg)), io.SeekCurrent)
-			val := make([]byte, 0, mLength)
-			_, err = cursor.Read(val)
-			if err != nil {
-				return
-			}
-			buf := bytes.NewBuffer(make([]byte, 0, binary.Size(msg.Timestamp)))
-			binary.Write(buf, binary.BigEndian, msg.Timestamp)
-			key := buf.Bytes()
-			batch.Put(append([]byte("chron/"), key...), val)
-			sym := append([]byte(fmt.Sprintf("asset/%s/", msg.Symbol.String())), key...)
-			typ := append([]byte(fmt.Sprintf("event/%c/", msg.Typecode)), key...)
-			batch.Put(sym, []byte{})
-			batch.Put(typ, []byte{})
+		} else {
+			_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 			if err != nil {
 				return
 			}
@@ -76,79 +123,77 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 }
 
 func main() {
-	dbName := ""
-	allow := ""
-	flag.StringVar(&dbName, "db", "", "path to destination LevelDB")
+	var (
+		dbName, allow string
+	)
+	flag.StringVar(&dbName, "db", "hist.db", "path to destination LevelDB")
 	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
 	flag.Parse()
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, &opt.Options{
-		WriteBuffer: 64 << 20,
-		// BlockSize:   128 << 20,
-		// BlockCacheCapacity: 128 << 20,
-		// DisableBlockCache: true,
-	})
-	// db, err := leveldb.OpenFile(dbName, nil)
+	db, err := leveldb.OpenFile(dbName, nil)
 	fck(err)
 	defer db.Close()
-	batches := make(chan *leveldb.Batch, 128)
-	defer close(batches)
-	payloads := make(chan []byte)
-	defer close(payloads)
 	msgTypes := map[byte]struct{}{}
 	for _, t := range []byte(allow) {
 		msgTypes[t] = struct{}{}
 	}
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
+	payloads := make(chan []byte, 1024)
+	defer close(payloads)
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			batch := &leveldb.Batch{}
-			flush := func(batch *leveldb.Batch) {
-				batches <- batch
+			batch := leveldb.Batch{}
+			batchSize := 1 << 16
+			flush := func() {
+				err = db.Write(&batch, nil)
+				fck(err)
+				batch.Reset()
 			}
-			defer flush(batch)
+			defer flush()
 			for payload := range payloads {
-				err := processPayload(batch, msgTypes, payload)
+				err := processPayload(&batch, msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
-				if batch.Len() >= 1<<16 {
-					flush(batch)
-					batch = &leveldb.Batch{}
+				if batch.Len() >= batchSize {
+					flush()
 				}
 			}
 		}()
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for batch := range batches {
-			err := db.Write(batch, &opt.WriteOptions{NoWriteMerge: true})
-			fck(err)
-		}
-	}()
-
 	paths := flag.Args()
 	for _, path := range paths {
-		stat, err := os.Stat(path)
-		fck(err)
-		bar := progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
-		defer bar.Close()
-		f, err := os.Open(path)
-		fck(err)
+		var (
+			f   *os.File
+			bar *progressbar.ProgressBar
+			err error
+		)
+		stdin := path == "-"
+
+		if stdin {
+			bar = progressbar.DefaultBytes(-1, "ingest stdin...")
+			f = os.Stdin
+		} else {
+			stat, err := os.Stat(path)
+			fck(err)
+			bar = progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
+			f, err = os.Open(path)
+			fck(err)
+		}
 		t := io.TeeReader(f, bar)
 		g, err := pgzip.NewReader(t)
 		fck(err)
 		p, err := pcapgo.NewNgReader(g, pcapgo.DefaultNgReaderOptions)
 		fck(err)
-		defer g.Close()
+		if !stdin {
+			defer g.Close()
+		}
 		fck(err)
 		src := gopacket.NewPacketSource(p, p.LinkType())
 		src.DecodeOptions.Lazy = true
