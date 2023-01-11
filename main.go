@@ -26,9 +26,9 @@ func fck(err error) {
 
 const keySep = "::"
 
-func writePoint(batch *leveldb.Batch, msg Message, field string, value interface{}) {
+func writePoint(batch *leveldb.Batch, msg Message, order Order) {
 	ksz := 0
-	grp := []interface{}{field, msg.Typecode, msg.Symbol.String(), msg.Timestamp}
+	grp := []interface{}{msg.Timestamp, msg.Symbol.String(), msg.Typecode}
 	for i, v := range grp {
 		ksz += binary.Size(v)
 		if i != len(grp)-1 {
@@ -39,7 +39,9 @@ func writePoint(batch *leveldb.Batch, msg Message, field string, value interface
 	for i, v := range grp {
 		switch s := v.(type) {
 		case string:
-			key.WriteString(s)
+			if s != "" {
+				key.WriteString(s)
+			}
 		default:
 			binary.Write(key, binary.BigEndian, v)
 		}
@@ -47,8 +49,15 @@ func writePoint(batch *leveldb.Batch, msg Message, field string, value interface
 			key.WriteString(keySep)
 		}
 	}
-	val := bytes.NewBuffer(make([]byte, 0, binary.Size(value)))
-	binary.Write(val, binary.LittleEndian, value)
+	var (
+		price float32
+		size  Integer
+	)
+	price = order.Price.Float()
+	size = order.Size
+	val := bytes.NewBuffer(make([]byte, 0, binary.Size(price)+binary.Size(size)))
+	binary.Write(val, binary.LittleEndian, price)
+	binary.Write(val, binary.LittleEndian, size)
 	k := key.Bytes()
 	v := val.Bytes()
 	batch.Put(k, v)
@@ -84,28 +93,14 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 				if err != nil {
 					return
 				}
-				writePoint(batch, trade.Message, "price", trade.Price.Float())
-			case 'Q':
-				quote := QuoteUpdate{}
-				err = binary.Read(cursor, binary.LittleEndian, &quote)
-				if err != nil {
-					return
-				}
-				writePoint(batch, quote.Message, "ask_price", quote.BidPrice.Float())
-				writePoint(batch, quote.Message, "bid_price", quote.BidPrice.Float())
+				writePoint(batch, trade.Message, trade.Order)
 			case '8', '5':
 				order := PriceLevelUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &order)
 				if err != nil {
 					return
 				}
-				var field string
-				if typecode == '8' {
-					field = "bid_price"
-				} else {
-					field = "ask_price"
-				}
-				writePoint(batch, order.Message, field, order.Price.Float())
+				writePoint(batch, order.Message, order.Order)
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -127,7 +122,7 @@ func main() {
 		dbName, allow string
 	)
 	flag.StringVar(&dbName, "db", "hist.db", "path to destination LevelDB")
-	flag.StringVar(&allow, "allow", "TQ85", "allowed event typecodes")
+	flag.StringVar(&allow, "allow", "T85", "allowed event typecodes")
 	flag.Parse()
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")

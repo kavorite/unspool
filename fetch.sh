@@ -19,7 +19,7 @@ read -r -d '' qry << EOQ
     | flatten(1)
     | map(select(.date >= "$f"))
     | map(select(.date <= "$t"))
-    | map(select(.feed == "TOPS"))
+    | map(select(.feed == "DEEP"))
     | sort_by(.date)
     | map(.link)
     | join("\n")
