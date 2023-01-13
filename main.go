@@ -24,40 +24,24 @@ func fck(err error) {
 	}
 }
 
-const keySep = "::"
-
 func writePoint(batch *leveldb.Batch, msg Message, order Order) {
-	ksz := 0
-	grp := []interface{}{msg.Timestamp, msg.Symbol.String(), msg.Typecode}
-	for i, v := range grp {
-		ksz += binary.Size(v)
-		if i != len(grp)-1 {
-			ksz += len(keySep)
-		}
-	}
-	key := bytes.NewBuffer(make([]byte, 0, ksz))
-	for i, v := range grp {
-		switch s := v.(type) {
-		case string:
-			if s != "" {
-				key.WriteString(s)
-			}
-		default:
-			binary.Write(key, binary.BigEndian, v)
-		}
-		if i != len(grp)-1 {
-			key.WriteString(keySep)
-		}
-	}
+	ksz := binary.Size(msg.Timestamp)
+	key := bytes.NewBuffer(make([]byte, 0, ksz+2))
+	key.WriteString("::")
+	binary.Write(key, binary.BigEndian, msg.Timestamp)
 	var (
-		price float32
-		size  Integer
+		symbol string
+		price  float32
+		size   Integer
 	)
+	symbol = msg.Symbol.String()
 	price = order.Price.Float()
 	size = order.Size
-	val := bytes.NewBuffer(make([]byte, 0, binary.Size(price)+binary.Size(size)))
+	val := bytes.NewBuffer(make([]byte, 0, binary.Size(msg.Typecode)+binary.Size(price)+binary.Size(size)))
+	binary.Write(val, binary.LittleEndian, msg.Typecode)
 	binary.Write(val, binary.LittleEndian, price)
 	binary.Write(val, binary.LittleEndian, size)
+	val.WriteString(symbol)
 	k := key.Bytes()
 	v := val.Bytes()
 	batch.Put(k, v)
@@ -70,6 +54,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 	if err != nil {
 		return
 	}
+	seen := make(map[string]struct{}, header.MessageCount)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -85,10 +70,18 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 		if err != nil {
 			return
 		}
+
+		writeSymbol := func(s string) {
+			if _, ok := seen[s]; !ok {
+				seen[s] = struct{}{}
+				batch.Put([]byte(fmt.Sprintf("symbol::%s", s)), []byte{})
+			}
+		}
 		if _, allow := allowTypeCodes[typecode]; allow {
 			switch typecode {
 			case 'T':
 				trade := TradeReport{}
+				writeSymbol(trade.Symbol.String())
 				err = binary.Read(cursor, binary.LittleEndian, &trade)
 				if err != nil {
 					return
@@ -100,6 +93,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 				if err != nil {
 					return
 				}
+				writeSymbol(order.Symbol.String())
 				writePoint(batch, order.Message, order.Order)
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
