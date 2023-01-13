@@ -1,6 +1,7 @@
 package main
 
 import (
+	"C"
 	"bytes"
 	"encoding/binary"
 	"flag"
@@ -13,10 +14,13 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
-	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"wellquite.org/golmdb"
 
 	"github.com/schollz/progressbar/v3"
 )
+import "errors"
 
 func fck(err error) {
 	if err != nil {
@@ -24,7 +28,17 @@ func fck(err error) {
 	}
 }
 
-func writePoint(batch *leveldb.Batch, msg Message, order Order) {
+type Write struct {
+	Key, Val []byte
+}
+
+type Batch []Write
+
+func (b *Batch) Put(key, val []byte) {
+	*b = append(*b, Write{key, val})
+}
+
+func writePoint(batch *Batch, msg Message, order Order) {
 	ksz := binary.Size(msg.Timestamp)
 	key := bytes.NewBuffer(make([]byte, 0, ksz+2))
 	key.WriteString("::")
@@ -47,7 +61,7 @@ func writePoint(batch *leveldb.Batch, msg Message, order Order) {
 	batch.Put(k, v)
 }
 
-func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (batch Batch, err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
@@ -55,6 +69,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 		return
 	}
 	seen := make(map[string]struct{}, header.MessageCount)
+	batch = make(Batch, 0, header.MessageCount)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -86,7 +101,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 				if err != nil {
 					return
 				}
-				writePoint(batch, trade.Message, trade.Order)
+				writePoint(&batch, trade.Message, trade.Order)
 			case '8', '5':
 				order := PriceLevelUpdate{}
 				err = binary.Read(cursor, binary.LittleEndian, &order)
@@ -94,7 +109,7 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 					return
 				}
 				writeSymbol(order.Symbol.String())
-				writePoint(batch, order.Message, order.Order)
+				writePoint(&batch, order.Message, order.Order)
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -113,18 +128,25 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 
 func main() {
 	var (
-		dbName, allow string
+		dbName, dbPath, allow string
 	)
-	flag.StringVar(&dbName, "db", "hist.db", "path to destination LevelDB")
+	flag.StringVar(&dbName, "db", "hist", "name of the top-level LMDB database")
+	flag.StringVar(&dbPath, "path", "./hist.lmdb", "path to destination LMDB")
 	flag.StringVar(&allow, "allow", "T85", "allowed event typecodes")
 	flag.Parse()
-	if dbName == "" {
+	if dbPath == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, nil)
+	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		fck(os.Mkdir(dbPath, 0755))
+	}
+	db, err := golmdb.NewLMDB(log.Logger, dbPath, 0644, 1, 1, golmdb.MapAsync, uint(runtime.NumCPU())*2)
 	fck(err)
-	defer db.Close()
+	defer db.Sync(true)
+	defer db.TerminateSync()
 	msgTypes := map[byte]struct{}{}
 	for _, t := range []byte(allow) {
 		msgTypes[t] = struct{}{}
@@ -133,26 +155,37 @@ func main() {
 	defer wg.Wait()
 	payloads := make(chan []byte, 1024)
 	defer close(payloads)
+	var ref golmdb.DBRef
+	err = db.Update(func(txn *golmdb.ReadWriteTxn) (err error) {
+		ref, err = txn.DBRef("hist", golmdb.Create)
+		return
+	})
+	fck(err)
 	for i := 0; i < runtime.NumCPU()*2; i++ {
 		wg.Add(1)
+		var batch Batch
 		go func() {
 			defer wg.Done()
-			batch := leveldb.Batch{}
-			batchSize := 1 << 16
 			flush := func() {
-				err = db.Write(&batch, nil)
+				err = db.Update(func(txn *golmdb.ReadWriteTxn) (err error) {
+					for _, put := range batch {
+						err = txn.Put(ref, put.Key, put.Val, 0)
+						if err != nil {
+							return
+						}
+					}
+					return
+				})
 				fck(err)
-				batch.Reset()
 			}
 			defer flush()
 			for payload := range payloads {
-				err := processPayload(&batch, msgTypes, payload)
+				var err error
+				batch, err = processPayload(msgTypes, payload)
 				if err != io.EOF {
 					fck(err)
 				}
-				if batch.Len() >= batchSize {
-					flush()
-				}
+				flush()
 			}
 		}()
 	}
