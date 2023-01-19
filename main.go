@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -25,20 +24,20 @@ func fck(err error) {
 }
 
 type Record struct {
-	time  time.Time
-	event string
-	asset string
-	price float32
-	size  float32
+	Time  int64
+	Event string
+	Asset string
+	Price float32
+	Size  float32
 }
 
 func makeRecord(m Message, o Order) Record {
 	return Record{
-		time:  m.Time(),
-		event: string(m.Typecode),
-		asset: m.Symbol.String(),
-		price: o.Price.Float(),
-		size:  float32(o.Size),
+		Time:  m.Time().UnixNano(),
+		Event: string(m.Typecode),
+		Asset: m.Symbol.String(),
+		Price: o.Price.Float(),
+		Size:  float32(o.Size),
 	}
 }
 
@@ -120,74 +119,76 @@ func main() {
 		msgTypes[t] = struct{}{}
 	}
 	paths := flag.Args()
-	payloads := make(chan []byte, 1024)
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	defer wg.Wait()
+	payloads := make(chan []byte, 1<<12)
 	go func() {
-		defer wg.Done()
-		var (
-			ostrm *os.File
-			steno *parquet.GenericWriter[Record]
-		)
-		defer func() {
-			if steno != nil {
-				steno.Flush()
-				steno.Close()
-			}
-		}()
-		for payload := range payloads {
-			records, err := processPayload(msgTypes, payload)
-			fck(err)
-			if len(records) > 0 {
-				opath := datePartName(dbName, records[0].time.UTC().Truncate(24*time.Hour))
-				if ostrm == nil || ostrm.Name() != opath {
-					if steno != nil {
-						err = steno.Close()
-						fck(err)
-					}
-					ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0644)
-					fck(err)
-					steno = parquet.NewGenericWriter[Record](ostrm)
-				}
-				_, err = steno.Write(records)
+		defer close(payloads)
+		for _, path := range paths {
+			var (
+				f   *os.File
+				bar *progressbar.ProgressBar
+				err error
+			)
+			stdin := path == "-"
+
+			if stdin {
+				bar = progressbar.DefaultBytes(-1, "ingest stdin...")
+				f = os.Stdin
+			} else {
+				stat, err := os.Stat(path)
 				fck(err)
+				bar = progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
+				f, err = os.Open(path)
+				fck(err)
+			}
+			t := io.TeeReader(f, bar)
+			g, err := pgzip.NewReader(t)
+			fck(err)
+			p, err := pcapgo.NewNgReader(g, pcapgo.DefaultNgReaderOptions)
+			fck(err)
+			if !stdin {
+				defer g.Close()
+			}
+			fck(err)
+			src := gopacket.NewPacketSource(p, p.LinkType())
+			src.DecodeOptions.Lazy = true
+			src.DecodeOptions.NoCopy = true
+			for packet := range src.Packets() {
+				payloads <- packet.ApplicationLayer().LayerContents()
 			}
 		}
 	}()
-	for _, path := range paths {
-		var (
-			f   *os.File
-			bar *progressbar.ProgressBar
-			err error
-		)
-		stdin := path == "-"
-
-		if stdin {
-			bar = progressbar.DefaultBytes(-1, "ingest stdin...")
-			f = os.Stdin
-		} else {
-			stat, err := os.Stat(path)
-			fck(err)
-			bar = progressbar.DefaultBytes(stat.Size(), fmt.Sprintf("ingest %s...", path))
-			f, err = os.Open(path)
-			fck(err)
+	var (
+		ostrm *os.File
+		steno *parquet.GenericWriter[Record]
+		count int
+	)
+	defer func() (err error) {
+		if steno != nil {
+			err = steno.Close()
 		}
-		t := io.TeeReader(f, bar)
-		g, err := pgzip.NewReader(t)
+		return
+	}()
+	for payload := range payloads {
+		records, err := processPayload(msgTypes, payload)
 		fck(err)
-		p, err := pcapgo.NewNgReader(g, pcapgo.DefaultNgReaderOptions)
-		fck(err)
-		if !stdin {
-			defer g.Close()
-		}
-		fck(err)
-		src := gopacket.NewPacketSource(p, p.LinkType())
-		src.DecodeOptions.Lazy = true
-		src.DecodeOptions.NoCopy = true
-		for packet := range src.Packets() {
-			payloads <- packet.ApplicationLayer().LayerContents()
+		if len(records) > 0 {
+			opath := datePartName(dbName, time.Unix(0, records[0].Time))
+			if ostrm == nil || ostrm.Name() != opath {
+				if ostrm != nil && count > 0 {
+					steno.Close()
+				}
+				ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0644)
+				fck(err)
+				if steno == nil {
+					steno = parquet.NewGenericWriter[Record](ostrm, parquet.SortingWriterConfig(parquet.SortingColumns(parquet.Ascending("Time"))))
+				} else {
+					steno.Reset(ostrm)
+				}
+				count = 0
+			}
+			_, err = steno.Write(records)
+			fck(err)
+			count += len(records)
 		}
 	}
-	close(payloads)
 }
