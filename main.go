@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
-	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/segmentio/parquet-go"
 
 	"github.com/schollz/progressbar/v3"
 )
@@ -24,37 +24,32 @@ func fck(err error) {
 	}
 }
 
-func writePoint(batch *leveldb.Batch, msg Message, order Order) {
-	ksz := binary.Size(msg.Timestamp)
-	key := bytes.NewBuffer(make([]byte, 0, ksz+2))
-	key.WriteString("::")
-	binary.Write(key, binary.BigEndian, msg.Timestamp)
-	var (
-		symbol string
-		price  float32
-		size   Integer
-	)
-	symbol = msg.Symbol.String()
-	price = order.Price.Float()
-	size = order.Size
-	val := bytes.NewBuffer(make([]byte, 0, binary.Size(msg.Typecode)+binary.Size(price)+binary.Size(size)))
-	binary.Write(val, binary.LittleEndian, msg.Typecode)
-	binary.Write(val, binary.LittleEndian, price)
-	binary.Write(val, binary.LittleEndian, size)
-	val.WriteString(symbol)
-	k := key.Bytes()
-	v := val.Bytes()
-	batch.Put(k, v)
+type Record struct {
+	time  time.Time
+	event string
+	asset string
+	price float32
+	size  float32
 }
 
-func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payload []byte) (err error) {
+func makeRecord(m Message, o Order) Record {
+	return Record{
+		time:  m.Time(),
+		event: string(m.Typecode),
+		asset: m.Symbol.String(),
+		price: o.Price.Float(),
+		size:  float32(o.Size),
+	}
+}
+
+func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records []Record, err error) {
 	cursor := bytes.NewReader(payload)
 	header := TransportHeader{}
 	err = binary.Read(cursor, binary.LittleEndian, &header)
 	if err != nil {
 		return
 	}
-	seen := make(map[string]struct{}, header.MessageCount)
+	records = make([]Record, 0, header.MessageCount)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -71,30 +66,22 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 			return
 		}
 
-		writeSymbol := func(s string) {
-			if _, ok := seen[s]; !ok {
-				seen[s] = struct{}{}
-				batch.Put([]byte(fmt.Sprintf("symbol::%s", s)), []byte{})
-			}
-		}
 		if _, allow := allowTypeCodes[typecode]; allow {
 			switch typecode {
 			case 'T':
 				trade := TradeReport{}
-				writeSymbol(trade.Symbol.String())
 				err = binary.Read(cursor, binary.LittleEndian, &trade)
 				if err != nil {
 					return
 				}
-				writePoint(batch, trade.Message, trade.Order)
+				records = append(records, makeRecord(trade.Message, trade.Order))
 			case '8', '5':
-				order := PriceLevelUpdate{}
-				err = binary.Read(cursor, binary.LittleEndian, &order)
+				level := PriceLevelUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &level)
 				if err != nil {
 					return
 				}
-				writeSymbol(order.Symbol.String())
-				writePoint(batch, order.Message, order.Order)
+				records = append(records, makeRecord(level.Message, level.Order))
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -111,52 +98,63 @@ func processPayload(batch *leveldb.Batch, allowTypeCodes map[byte]struct{}, payl
 	return
 }
 
+func datePartName(root string, date time.Time) string {
+	return root + string(os.PathSeparator) + date.UTC().Format("2006-01-02") + ".parquet"
+}
+
 func main() {
 	var (
 		dbName, allow string
 	)
-	flag.StringVar(&dbName, "db", "hist.db", "path to destination LevelDB")
+	flag.StringVar(&dbName, "db", "hist", "path to destination parquet database")
 	flag.StringVar(&allow, "allow", "T85", "allowed event typecodes")
 	flag.Parse()
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
 		os.Exit(-1)
 	}
-	db, err := leveldb.OpenFile(dbName, nil)
+	err := os.MkdirAll(dbName, 0755)
 	fck(err)
-	defer db.Close()
 	msgTypes := map[byte]struct{}{}
 	for _, t := range []byte(allow) {
 		msgTypes[t] = struct{}{}
 	}
-	wg := sync.WaitGroup{}
-	defer wg.Wait()
+	paths := flag.Args()
 	payloads := make(chan []byte, 1024)
-	defer close(payloads)
-	for i := 0; i < runtime.NumCPU()*2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			batch := leveldb.Batch{}
-			batchSize := 1 << 16
-			flush := func() {
-				err = db.Write(&batch, nil)
-				fck(err)
-				batch.Reset()
-			}
-			defer flush()
-			for payload := range payloads {
-				err := processPayload(&batch, msgTypes, payload)
-				if err != io.EOF {
-					fck(err)
-				}
-				if batch.Len() >= batchSize {
-					flush()
-				}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	defer wg.Wait()
+	go func() {
+		defer wg.Done()
+		var (
+			ostrm *os.File
+			steno *parquet.GenericWriter[Record]
+		)
+		defer func() {
+			if steno != nil {
+				steno.Flush()
+				steno.Close()
 			}
 		}()
-	}
-	paths := flag.Args()
+		for payload := range payloads {
+			records, err := processPayload(msgTypes, payload)
+			fck(err)
+			if len(records) > 0 {
+				opath := datePartName(dbName, records[0].time.UTC().Truncate(24*time.Hour))
+				if ostrm == nil || ostrm.Name() != opath {
+					if steno != nil {
+						err = steno.Close()
+						fck(err)
+					}
+					ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0644)
+					fck(err)
+					steno = parquet.NewGenericWriter[Record](ostrm)
+				}
+				_, err = steno.Write(records)
+				fck(err)
+			}
+		}
+	}()
 	for _, path := range paths {
 		var (
 			f   *os.File
@@ -191,4 +189,5 @@ func main() {
 			payloads <- packet.ApplicationLayer().LayerContents()
 		}
 	}
+	close(payloads)
 }
