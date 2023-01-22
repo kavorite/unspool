@@ -24,7 +24,7 @@ func fck(err error) {
 }
 
 type Record struct {
-	Time  int64
+	Time  time.Time
 	Event string
 	Asset string
 	Price float32
@@ -33,7 +33,7 @@ type Record struct {
 
 func makeRecord(m Message, o Order) Record {
 	return Record{
-		Time:  m.Time().UnixNano(),
+		Time:  m.Time(),
 		Event: string(m.Typecode),
 		Asset: m.Symbol.String(),
 		Price: o.Price.Float(),
@@ -160,7 +160,6 @@ func main() {
 	var (
 		ostrm *os.File
 		steno *parquet.GenericWriter[Record]
-		count int
 	)
 	defer func() (err error) {
 		if steno != nil {
@@ -172,23 +171,25 @@ func main() {
 		records, err := processPayload(msgTypes, payload)
 		fck(err)
 		if len(records) > 0 {
-			opath := datePartName(dbName, time.Unix(0, records[0].Time))
+			opath := datePartName(dbName, records[0].Time)
 			if ostrm == nil || ostrm.Name() != opath {
-				if ostrm != nil && count > 0 {
+				if ostrm != nil {
 					steno.Close()
 				}
 				ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0644)
 				fck(err)
 				if steno == nil {
-					steno = parquet.NewGenericWriter[Record](ostrm, parquet.SortingWriterConfig(parquet.SortingColumns(parquet.Ascending("Time"))))
+					pqopt := []parquet.WriterOption{
+						parquet.SortingWriterConfig(parquet.SortingColumns(parquet.Ascending("Time"))),
+						// parquet.BloomFilters(parquet.SplitBlockFilter(32, "Asset")),
+					}
+					steno = parquet.NewGenericWriter[Record](ostrm, pqopt...)
 				} else {
 					steno.Reset(ostrm)
 				}
-				count = 0
 			}
 			_, err = steno.Write(records)
 			fck(err)
-			count += len(records)
 		}
 	}
 }
