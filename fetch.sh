@@ -1,4 +1,4 @@
-f=`date --iso | tr -d '-'`
+f=`date --iso -d 'yesterday' | tr -d '-'`
 t=`date --iso | tr -d '-'`
 while getopts ":f:t:" opt; do 
     case $opt in
