@@ -4,14 +4,13 @@ while getopts ":f:t:" opt; do
     case $opt in
         f)
             f=$OPTARG
-            shift 2
         ;;
         t)
             t=$OPTARG
-            shift 2
         ;;
     esac
 done
+shift $((OPTIND-1))
 
 read -r -d '' qry << EOQ
     to_entries
@@ -19,7 +18,7 @@ read -r -d '' qry << EOQ
     | flatten(1)
     | map(select(.date >= "$f"))
     | map(select(.date <= "$t"))
-    | map(select(.feed == "DEEP"))
+    | map(select(.feed == "TOPS"))
     | sort_by(.date)
     | map(.link)
     | join("\n")

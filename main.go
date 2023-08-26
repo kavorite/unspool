@@ -81,6 +81,17 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 					return
 				}
 				records = append(records, makeRecord(level.Message, level.Order))
+			case 'Q':
+				quote := QuoteUpdate{}
+				err = binary.Read(cursor, binary.LittleEndian, &quote)
+				if err != nil {
+					return
+				}
+				msg := quote.Message
+				msg.Typecode = '8'
+				records = append(records, makeRecord(msg, Order{quote.BidSize, quote.BidPrice}))
+				msg.Typecode = '5'
+				records = append(records, makeRecord(msg, Order{quote.AskSize, quote.AskPrice}))
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
 				if err != nil {
@@ -106,7 +117,7 @@ func main() {
 		dbName, allow string
 	)
 	flag.StringVar(&dbName, "db", "hist", "path to destination parquet database")
-	flag.StringVar(&allow, "allow", "T85", "allowed event typecodes")
+	flag.StringVar(&allow, "allow", "T85Q", "allowed event typecodes")
 	flag.Parse()
 	if dbName == "" {
 		fmt.Fprintf(os.Stderr, "missing -db\n")
