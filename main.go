@@ -48,7 +48,7 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 	if err != nil {
 		return
 	}
-	records = make([]Record, 0, header.MessageCount)
+	records = make([]Record, 0, header.MessageCount*2)
 	for i := 0; i < int(header.MessageCount)-1; i++ {
 		var mLength Short
 		err = binary.Read(cursor, binary.LittleEndian, &mLength)
@@ -88,9 +88,9 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 					return
 				}
 				msg := quote.Message
-				msg.Typecode = '8'
+				msg.Typecode = 'B'
 				records = append(records, makeRecord(msg, Order{quote.BidSize, quote.BidPrice}))
-				msg.Typecode = '5'
+				msg.Typecode = 'S'
 				records = append(records, makeRecord(msg, Order{quote.AskSize, quote.AskPrice}))
 			default:
 				_, err = cursor.Seek(int64(mLength), io.SeekCurrent)
@@ -187,7 +187,7 @@ func main() {
 				if ostrm != nil {
 					steno.Close()
 				}
-				ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0644)
+				ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 				fck(err)
 				if steno == nil {
 					pqopt := []parquet.WriterOption{
