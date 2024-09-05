@@ -28,6 +28,6 @@ hist='https://iextrading.com/api/1.0/hist'
 entries=$(curl -s "$hist" | jq -c "$qry")
 echo "$entries" | jq -r '.[] | "\(.date) \(.link)"' | while read -r date link; do
     output_file="hist/$date.parquet"
-    echo "Creating $output_file"
+    mkdir -p hist/
     curl -Ls "$link" | ./unspool "$@" - > "${output_file}"
 done
