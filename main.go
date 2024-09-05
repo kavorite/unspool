@@ -9,10 +9,15 @@ import (
 	"os"
 	"time"
 
+	"github.com/apache/arrow/go/v12/arrow"
+	"github.com/apache/arrow/go/v12/arrow/array"
+	"github.com/apache/arrow/go/v12/arrow/memory"
+	"github.com/apache/arrow/go/v12/parquet"
+	"github.com/apache/arrow/go/v12/parquet/compress"
+	"github.com/apache/arrow/go/v12/parquet/pqarrow"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/klauspost/pgzip"
-	"github.com/segmentio/parquet-go"
 
 	"github.com/schollz/progressbar/v3"
 )
@@ -108,10 +113,6 @@ func processPayload(allowTypeCodes map[byte]struct{}, payload []byte) (records [
 	return
 }
 
-func datePartName(root string, date time.Time) string {
-	return root + string(os.PathSeparator) + date.UTC().Format("2006-01-02") + ".parquet"
-}
-
 func main() {
 	var (
 		dbName, allow string
@@ -168,39 +169,62 @@ func main() {
 			}
 		}
 	}()
-	var (
-		ostrm *os.File
-		steno *parquet.GenericWriter[Record]
+	fck(err)
+
+	// Create a schema for the Parquet file
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "time", Type: arrow.FixedWidthTypes.Timestamp_ns},
+			{Name: "event", Type: arrow.BinaryTypes.String},
+			{Name: "asset", Type: arrow.BinaryTypes.String},
+			{Name: "price", Type: arrow.PrimitiveTypes.Float32},
+			{Name: "size", Type: arrow.PrimitiveTypes.Float32},
+		},
+		nil,
 	)
-	defer func() (err error) {
-		if steno != nil {
-			err = steno.Close()
-		}
-		return
-	}()
+
+	// Create parquet.WriterProperties
+	writerProps := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+
+	// Create pqarrow.ArrowWriterProperties
+	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
+
+	// Create a parquet.Writer that writes to stdout
+	w, err := pqarrow.NewFileWriter(schema, os.Stdout, writerProps, arrowProps)
+	fck(err)
+	defer w.Close()
+
+	// Create a record builder
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+
 	for payload := range payloads {
 		records, err := processPayload(msgTypes, payload)
 		fck(err)
-		if len(records) > 0 {
-			opath := datePartName(dbName, records[0].Time)
-			if ostrm == nil || ostrm.Name() != opath {
-				if ostrm != nil {
-					steno.Close()
-				}
-				ostrm, err = os.OpenFile(opath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+
+		for _, record := range records {
+			b.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(record.Time.UnixNano()))
+			b.Field(1).(*array.StringBuilder).Append(record.Event)
+			b.Field(2).(*array.StringBuilder).Append(record.Asset)
+			b.Field(3).(*array.Float32Builder).Append(record.Price)
+			b.Field(4).(*array.Float32Builder).Append(record.Size)
+
+			if b.Field(0).Len() >= 1000 {
+				// Write the record batch
+				rec := b.NewRecord()
+				err = w.Write(rec)
 				fck(err)
-				if steno == nil {
-					pqopt := []parquet.WriterOption{
-						parquet.SortingWriterConfig(parquet.SortingColumns(parquet.Ascending("Time"))),
-						// parquet.BloomFilters(parquet.SplitBlockFilter(32, "Asset")),
-					}
-					steno = parquet.NewGenericWriter[Record](ostrm, pqopt...)
-				} else {
-					steno.Reset(ostrm)
-				}
+				rec.Release()
+				b = array.NewRecordBuilder(memory.DefaultAllocator, schema)
 			}
-			_, err = steno.Write(records)
-			fck(err)
 		}
+	}
+
+	// Write any remaining records
+	if b.Field(0).Len() > 0 {
+		rec := b.NewRecord()
+		err = w.Write(rec)
+		fck(err)
+		rec.Release()
 	}
 }
